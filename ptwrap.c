@@ -27,7 +27,7 @@ main (int argc, char * const *argv)
         printf("argv[%d]=\"%s\"\n", i, argv[i]);
     }
 
-    int masterfd, slavefd;
+    int masterfd;
     char *slavedevice;
 
     masterfd = posix_openpt(O_RDWR | O_NOCTTY);
@@ -46,11 +46,6 @@ main (int argc, char * const *argv)
 
     printf("slave device is: %s\n", slavedevice);
 
-    slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
-    if (slavefd < 0) {
-        return -1;
-    }
-
     pid_t pid;
 
     pid = fork();
@@ -59,11 +54,18 @@ main (int argc, char * const *argv)
         perror("fork()");
         return -1;
 
-    case 0:
+    case 0: {
         /* Child process */
+
+        int slavefd;
 
         close(masterfd);
         setsid();
+
+        slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
+        if (slavefd < 0) {
+            return -1;
+        }
 
         if (ioctl(slavefd, TIOCSCTTY, NULL) == -1)
         {
@@ -81,6 +83,7 @@ main (int argc, char * const *argv)
             return -1;
         }
         break;
+    }
 
     default:
         /* Parent process */
@@ -92,8 +95,8 @@ main (int argc, char * const *argv)
         ssize_t sz;
         char buf[4096];
         int flags;
-
         struct sigaction sa;
+
         sa.sa_handler = sig_chld;
         sigaction(SIGCHLD, &sa, 0);
 
@@ -151,6 +154,10 @@ main (int argc, char * const *argv)
                         if (errno == EWOULDBLOCK) {
                             break;
                         }
+                        if (errno == EIO) {
+                            eof = 1;
+                            break;
+                        }
                         perror("read(masterfd)");
                         return -1;
                     }
@@ -174,7 +181,8 @@ main (int argc, char * const *argv)
         return -1;
     }
     printf("Child status %d\n", WEXITSTATUS(status));
-    
+
+    close(masterfd);
 
     return 0;
 }
