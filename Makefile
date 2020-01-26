@@ -1,4 +1,4 @@
-CFLAGS+=-g -Wall
+CFLAGS+=-g -Wall -Wextra -Wno-unused-parameter
 
 all: ptwrap
 
