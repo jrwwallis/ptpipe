@@ -1,7 +1,7 @@
-CFLAGS+=-g -Wall -Wextra -Wno-unused-parameter
+CFLAGS+=-g -Wall -Wextra -Werror -Wno-unused-parameter
 
-all: ptwrap
+all: ptwrap ptread
 
 clean:
-	rm ptwrap
+	rm -f ptwrap ptread
 
