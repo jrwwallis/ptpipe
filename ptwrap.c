@@ -4,27 +4,37 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <pthread.h>
 #include <errno.h>
+#include <assert.h>
 
-static int eof = 0;
+static pthread_mutex_t done_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t done_condvar = PTHREAD_COND_INITIALIZER;
+static int done = 0;
 
-void sig_chld (int signum)
+void sig_chld(int signum)
 {
-    eof = 1;
+    pthread_mutex_lock(&done_mutex);
+    done = 1;
+    pthread_cond_signal(&done_condvar);
+    pthread_mutex_unlock(&done_mutex);
     return;
 }
 
-int child (int masterfd, int argc, char *const *argv)
+int child(int masterfd, int argc, char *const *argv)
 {
     int slavefd;
     char *slavedevice;
 
     slavedevice = ptsname(masterfd);
-    if (slavedevice == NULL) {
+    if (slavedevice == NULL)
+    {
         perror("ptsname()");
         return -1;
     }
@@ -33,11 +43,13 @@ int child (int masterfd, int argc, char *const *argv)
     setsid();
 
     slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
-    if (slavefd < 0) {
+    if (slavefd < 0)
+    {
         return -1;
     }
 
-    if (ioctl(slavefd, TIOCSCTTY, NULL) == -1) {
+    if (ioctl(slavefd, TIOCSCTTY, NULL) == -1)
+    {
         perror("ioctl(TIOCSCTTY)");
         return -1;
     }
@@ -47,7 +59,8 @@ int child (int masterfd, int argc, char *const *argv)
     dup2(slavefd, STDERR_FILENO);
     close(slavefd);
 
-    if (execvp(argv[1], &argv[1]) == -1) {
+    if (execvp(argv[1], &argv[1]) == -1)
+    {
         perror("execvp()");
         return -1;
     }
@@ -55,98 +68,105 @@ int child (int masterfd, int argc, char *const *argv)
     return 0;
 }
 
-int parent (int masterfd)
+struct fd_splice_args_s
 {
-    int max_fd = masterfd + 1;
-    fd_set readfds;
-    int sel_fds;
+    const char *dirn;
+    int in_fd;
+    int out_fd;
+    ssize_t bufsz;
+};
+
+void *
+fd_splice(void *args)
+{
+    struct fd_splice_args_s *fd_splice_args = (struct fd_splice_args_s *)args;
     ssize_t sz;
-    char buf[4096];
-    int flags;
+    uint8_t *buf = (uint8_t *)malloc(fd_splice_args->bufsz);
+    assert(buf != NULL);
+
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    do {
+        sz = read(fd_splice_args->in_fd, buf, fd_splice_args->bufsz);
+        if (sz == -1) {
+            printf("read(%d), dirn=%s, errno=%d\n", fd_splice_args->in_fd, fd_splice_args->dirn, errno);
+            perror("read(STDIN_FILENO)");
+            break;
+        }
+        if (sz == 0) {
+            break;
+        }
+        sz = write(fd_splice_args->out_fd, buf, sz);
+        if (sz == -1) {
+            perror("write(masterfd)");
+            break;
+        }
+    } while (sz > 0);
+
+    free(buf);
+
+    pthread_mutex_lock(&done_mutex);
+    done = 1;
+    pthread_cond_signal(&done_condvar);
+    pthread_mutex_unlock(&done_mutex);
+
+    return NULL;
+}
+
+int parent(int masterfd)
+{
     struct sigaction sa;
+    pthread_t up, down;
+
+    struct fd_splice_args_s up_args = {
+        .dirn = "up",
+        .in_fd = STDIN_FILENO,
+        .out_fd = masterfd,
+        .bufsz = 4096,
+    };
+    struct fd_splice_args_s down_args = {
+        .dirn = "down",
+        .in_fd = masterfd,
+        .out_fd = STDOUT_FILENO,
+        .bufsz = 4096,
+    };
+
+    struct termios oldt, newt;
+
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
+    pthread_create(&down, NULL, fd_splice, &down_args);
+    pthread_create(&up, NULL, fd_splice, &up_args);
 
     sa.sa_handler = sig_chld;
     sigaction(SIGCHLD, &sa, 0);
 
-    flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-
-    flags = fcntl(masterfd, F_GETFL, 0);
-    fcntl(masterfd, F_SETFL, flags | O_NONBLOCK);
-
-    while (!eof) {
-        FD_ZERO(&readfds);
-
-        FD_SET(STDIN_FILENO, &readfds);
-        FD_SET(masterfd, &readfds);
-
-        sel_fds = select(max_fd, &readfds, NULL, NULL, NULL);
-        switch (sel_fds) {
-        case -1:
-            if (errno == EINTR) {
-                eof = 1;
-                break;
-            }
-            perror("select()");
-            return -1;
-
-        case 0:
-            continue;
-        }
-
-        if (FD_ISSET(STDIN_FILENO, &readfds)) {
-            do {
-                sz = read(STDIN_FILENO, buf, sizeof(buf));
-                if (sz == -1) {
-                    if (errno == EWOULDBLOCK) {
-                        break;
-                    }
-                    perror("read(STDIN_FILENO)");
-                    return -1;
-                }
-                if (sz == 0) {
-                    eof = 1;
-                }
-                if (write(masterfd, buf, sz) == -1) {
-                    perror("write(masterfd)");
-                    return -1;
-                }
-            } while (sz > 0);
-        }
-
-        if (FD_ISSET(masterfd, &readfds)) {
-            do {
-                sz = read(masterfd, buf, sizeof(buf));
-                if (sz == -1) {
-                    if (errno == EWOULDBLOCK) {
-                        break;
-                    }
-                    if (errno == EIO) {
-                        eof = 1;
-                        break;
-                    }
-                    perror("read(masterfd)");
-                    return -1;
-                }
-                if (sz == 0) {
-                    eof = 1;
-                }
-                if (write(STDOUT_FILENO, buf, sz) == -1) {
-                    perror("write(STDOUT_FILENO)");
-                    return -1;
-                }
-            } while (sz > 0);
-        }
+    pthread_mutex_lock(&done_mutex);
+    while (!done) {
+        pthread_cond_wait(&done_condvar, &done_mutex);
     }
+    pthread_mutex_unlock(&done_mutex);
+
+    pthread_cancel(down);
+    pthread_cancel(up);
+
+    pthread_join(down, NULL);
+    pthread_join(up, NULL);
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+
     return 0;
 }
 
-int main (int argc, char *const *argv)
+int main(int argc, char *const *argv)
 {
     int i;
 
     printf("argc=%d\n", argc);
-    for (i = 0; i < argc; i++) {
+    for (i = 0; i < argc; i++)
+    {
         printf("argv[%d]=\"%s\"\n", i, argv[i]);
     }
 
@@ -155,12 +175,14 @@ int main (int argc, char *const *argv)
 
     masterfd = posix_openpt(O_RDWR | O_NOCTTY);
 
-    if (masterfd == -1 || grantpt(masterfd) == -1 || unlockpt(masterfd) == -1) {
+    if (masterfd == -1 || grantpt(masterfd) == -1 || unlockpt(masterfd) == -1)
+    {
         return -1;
     }
 
     slavedevice = ptsname(masterfd);
-    if (slavedevice == NULL) {
+    if (slavedevice == NULL)
+    {
         perror("ptsname()");
         return -1;
     }
@@ -180,7 +202,8 @@ int main (int argc, char *const *argv)
     case 0:
         /* Child process */
         ret = child(masterfd, argc, argv);
-        if (-1 == ret) {
+        if (-1 == ret)
+        {
             return ret;
         }
         break;
@@ -190,20 +213,23 @@ int main (int argc, char *const *argv)
         printf("Child pid %d\n", pid);
 
         ret = parent(masterfd);
-        if (-1 == ret) {
+        if (-1 == ret)
+        {
             return ret;
         }
     }
 
     int status;
 
-    if (waitpid(pid, &status, 0) == -1) {
-        perror("waitpid()");
-        return -1;
-    }
-    printf("Child status %d\n", WEXITSTATUS(status));
-
+    waitpid(pid, &status, 0);
     close(masterfd);
-
-    return 0;
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        return 128 + (WTERMSIG(status));
+    } else if (WIFSTOPPED(status)) {
+        return 128 + (WSTOPSIG(status));
+    } else {
+        return 1;
+    }
 }
