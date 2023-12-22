@@ -1,48 +1,92 @@
-#define _XOPEN_SOURCE
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
-#include <string.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <pthread.h>
-#include <errno.h>
-#include <assert.h>
 
-static pthread_mutex_t done_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t done_condvar = PTHREAD_COND_INITIALIZER;
-static int done = 0;
+#include <iostream>
+#include <thread>
+#include <mutex>
 
 // TODO pass list of set/unset flags to constructor
-class TermAttr {
+class TermAttr
+{
 public:
-    TermAttr(int fd): fd{fd} {
+    TermAttr(int fd) : fd{fd}
+    {
         tcgetattr(fd, &oldt);
         newt = oldt;
         newt.c_lflag &= ~(ICANON);
         tcsetattr(fd, TCSANOW, &newt);
     };
-    ~TermAttr() {
+    ~TermAttr()
+    {
         tcsetattr(fd, TCSANOW, &oldt);
     };
+
 private:
     struct termios oldt, newt;
     int fd;
 };
 
-void sig_chld(int signum)
+class Splicer
 {
-    pthread_mutex_lock(&done_mutex);
-    done = 1;
-    pthread_cond_signal(&done_condvar);
-    pthread_mutex_unlock(&done_mutex);
-    return;
-}
+private:
+    std::thread sp_thread;
+    inline static std::mutex done_mutex{};
+    inline static std::condition_variable done_condvar{};
+    inline static bool all_done{false};
+    int in_fd;
+    int out_fd;
+    size_t bufsz;
+
+    void fd_splice()
+    {
+        ssize_t sz;
+        std::vector<uint8_t> buf (bufsz);
+
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+        do
+        {
+            sz = read(in_fd, buf.data(), bufsz);
+            if (sz == -1)
+            {
+                //printf("read(%d), dirn=%s, errno=%d\n", in_fd, fd_splice_args->dirn, errno);
+                perror("read(STDIN_FILENO)");
+                break;
+            }
+            if (sz == 0)
+            {
+                break;
+            }
+            sz = write(out_fd, buf.data(), sz);
+            if (sz == -1)
+            {
+                perror("write(masterfd)");
+                break;
+            }
+        } while (sz > 0);
+
+        {
+            std::lock_guard<std::mutex> lk(done_mutex);
+            all_done = true;
+        }
+        done_condvar.notify_one();
+    }
+
+public:
+    Splicer(int in_fd, int out_fd, size_t bufsz = 4096):in_fd(in_fd), out_fd(out_fd), bufsz(bufsz), sp_thread(std::thread( [this] {fd_splice();})) {
+    }
+    static inline void all_wait() {
+        std::unique_lock<std::mutex> lk(done_mutex);
+        done_condvar.wait(lk, []{return all_done;});
+
+    }
+    void join() {
+        sp_thread.join();
+    }
+};
+
 
 int child(int masterfd, int argc, char *const *argv)
 {
@@ -93,79 +137,18 @@ struct fd_splice_args_s
     ssize_t bufsz;
 };
 
-void *
-fd_splice(void *args)
-{
-    struct fd_splice_args_s *fd_splice_args = (struct fd_splice_args_s *)args;
-    ssize_t sz;
-    uint8_t *buf = (uint8_t *)malloc(fd_splice_args->bufsz);
-    assert(buf != NULL);
-
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    do {
-        sz = read(fd_splice_args->in_fd, buf, fd_splice_args->bufsz);
-        if (sz == -1) {
-            printf("read(%d), dirn=%s, errno=%d\n", fd_splice_args->in_fd, fd_splice_args->dirn, errno);
-            perror("read(STDIN_FILENO)");
-            break;
-        }
-        if (sz == 0) {
-            break;
-        }
-        sz = write(fd_splice_args->out_fd, buf, sz);
-        if (sz == -1) {
-            perror("write(masterfd)");
-            break;
-        }
-    } while (sz > 0);
-
-    free(buf);
-
-    pthread_mutex_lock(&done_mutex);
-    done = 1;
-    pthread_cond_signal(&done_condvar);
-    pthread_mutex_unlock(&done_mutex);
-
-    return NULL;
-}
-
 int parent(int masterfd)
 {
-    struct sigaction sa;
-    pthread_t up, down;
-
-    struct fd_splice_args_s up_args = {
-        .dirn = "up",
-        .in_fd = STDIN_FILENO,
-        .out_fd = masterfd,
-        .bufsz = 4096,
-    };
-    struct fd_splice_args_s down_args = {
-        .dirn = "down",
-        .in_fd = masterfd,
-        .out_fd = STDOUT_FILENO,
-        .bufsz = 4096,
-    };
-
     TermAttr ta{STDIN_FILENO};
 
-    pthread_create(&down, NULL, fd_splice, &down_args);
-    pthread_create(&up, NULL, fd_splice, &up_args);
+    Splicer up{STDIN_FILENO, masterfd};
+    Splicer down{masterfd, STDOUT_FILENO};
 
-    sa.sa_handler = sig_chld;
-    sigaction(SIGCHLD, &sa, 0);
+    Splicer::all_wait();
 
-    pthread_mutex_lock(&done_mutex);
-    while (!done) {
-        pthread_cond_wait(&done_condvar, &done_mutex);
-    }
-    pthread_mutex_unlock(&done_mutex);
-
-    pthread_cancel(down);
-    pthread_cancel(up);
-
-    pthread_join(down, NULL);
-    pthread_join(up, NULL);
+    close(masterfd);
+    up.join();
+    down.join();
 
     return 0;
 }
@@ -233,13 +216,20 @@ int main(int argc, char *const *argv)
 
     waitpid(pid, &status, 0);
     close(masterfd);
-    if (WIFEXITED(status)) {
+    if (WIFEXITED(status))
+    {
         return WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
+    }
+    else if (WIFSIGNALED(status))
+    {
         return 128 + (WTERMSIG(status));
-    } else if (WIFSTOPPED(status)) {
+    }
+    else if (WIFSTOPPED(status))
+    {
         return 128 + (WSTOPSIG(status));
-    } else {
+    }
+    else
+    {
         return 1;
     }
 }
