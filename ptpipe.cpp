@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
@@ -7,6 +6,9 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+//#include <boost/regex.hpp>
+
+static const size_t DEFAULT_BUFSZ = 4096;
 
 // TODO pass list of set/unset flags to constructor
 class TermAttr
@@ -31,6 +33,18 @@ private:
 
 class Splicer
 {
+public:
+    Splicer(int in_fd, int out_fd, size_t bufsz = DEFAULT_BUFSZ):
+        in_fd(in_fd), out_fd(out_fd), bufsz(bufsz), sp_thread(std::thread( [this] {fd_splice();})) {
+    }
+    ~Splicer() {
+        sp_thread.detach();
+    }
+    static inline void all_wait() {
+        std::unique_lock<std::mutex> lk(done_mutex);
+        done_condvar.wait(lk, []{return all_done;});
+    }
+
 private:
     std::thread sp_thread;
     inline static std::mutex done_mutex{};
@@ -59,6 +73,7 @@ private:
             {
                 break;
             }
+            
             sz = write(out_fd, buf.data(), sz);
             if (sz == -1)
             {
@@ -72,18 +87,6 @@ private:
             all_done = true;
         }
         done_condvar.notify_one();
-    }
-
-public:
-    Splicer(int in_fd, int out_fd, size_t bufsz = 4096):in_fd(in_fd), out_fd(out_fd), bufsz(bufsz), sp_thread(std::thread( [this] {fd_splice();})) {
-    }
-    static inline void all_wait() {
-        std::unique_lock<std::mutex> lk(done_mutex);
-        done_condvar.wait(lk, []{return all_done;});
-
-    }
-    void join() {
-        sp_thread.join();
     }
 };
 
@@ -129,15 +132,7 @@ int child(int masterfd, int argc, char *const *argv)
     return 0;
 }
 
-struct fd_splice_args_s
-{
-    const char *dirn;
-    int in_fd;
-    int out_fd;
-    ssize_t bufsz;
-};
-
-int parent(int masterfd)
+void parent(int masterfd)
 {
     TermAttr ta{STDIN_FILENO};
 
@@ -145,12 +140,6 @@ int parent(int masterfd)
     Splicer down{masterfd, STDOUT_FILENO};
 
     Splicer::all_wait();
-
-    close(masterfd);
-    up.join();
-    down.join();
-
-    return 0;
 }
 
 int main(int argc, char *const *argv)
@@ -205,11 +194,7 @@ int main(int argc, char *const *argv)
         /* Parent process */
         printf("Child pid %d\n", pid);
 
-        ret = parent(masterfd);
-        if (-1 == ret)
-        {
-            return ret;
-        }
+        parent(masterfd);
     }
 
     int status;
