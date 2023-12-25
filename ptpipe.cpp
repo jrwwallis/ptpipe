@@ -6,7 +6,9 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
-//#include <boost/regex.hpp>
+//#include <boost/process.hpp>
+
+//namespace bp = boost::process;
 
 static const size_t DEFAULT_BUFSZ = 4096;
 
@@ -30,6 +32,8 @@ private:
     struct termios oldt, newt;
     int fd;
 };
+
+namespace {
 
 class Splicer
 {
@@ -59,14 +63,12 @@ private:
         ssize_t sz;
         std::vector<uint8_t> buf (bufsz);
 
-        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
         do
         {
             sz = read(in_fd, buf.data(), bufsz);
             if (sz == -1)
             {
-                //printf("read(%d), dirn=%s, errno=%d\n", in_fd, fd_splice_args->dirn, errno);
-                perror("read(STDIN_FILENO)");
+                std::cerr << "read(STDIN_FILENO) error: " << errno << std::endl;
                 break;
             }
             if (sz == 0)
@@ -77,7 +79,7 @@ private:
             sz = write(out_fd, buf.data(), sz);
             if (sz == -1)
             {
-                perror("write(masterfd)");
+                std::cerr << "write(masterfd) error: " << errno << std::endl;
                 break;
             }
         } while (sz > 0);
@@ -93,28 +95,25 @@ private:
 
 int child(int masterfd, int argc, char *const *argv)
 {
-    int slavefd;
-    char *slavedevice;
-
-    slavedevice = ptsname(masterfd);
-    if (slavedevice == NULL)
+    char *slavedevice = ptsname(masterfd);
+    if (slavedevice == nullptr)
     {
-        perror("ptsname()");
+        std::cerr << "ptsname() error: " << errno << std::endl;
         return -1;
     }
 
     close(masterfd);
     setsid();
 
-    slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
+    int slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
     if (slavefd < 0)
     {
         return -1;
     }
 
-    if (ioctl(slavefd, TIOCSCTTY, NULL) == -1)
+    if (ioctl(slavefd, TIOCSCTTY, nullptr) == -1)
     {
-        perror("ioctl(TIOCSCTTY)");
+        std::cerr << "ioctl(TIOCSCTTY) error: " << errno << std::endl;
         return -1;
     }
 
@@ -125,7 +124,7 @@ int child(int masterfd, int argc, char *const *argv)
 
     if (execvp(argv[1], &argv[1]) == -1)
     {
-        perror("execvp()");
+        std::cerr << "execvp() error: " << errno << std::endl;
         return -1;
     }
 
@@ -142,39 +141,34 @@ void parent(int masterfd)
     Splicer::all_wait();
 }
 
+} // namespace
+
 int main(int argc, char *const *argv)
 {
-    int i;
-
-    printf("argc=%d\n", argc);
-    for (i = 0; i < argc; i++)
+    std::cout << "argc=" << argc << std::endl;
+    for (int i = 0; i < argc; i++)
     {
-        printf("argv[%d]=\"%s\"\n", i, argv[i]);
+        std::cout << "argv[" << i << "]=\"" << argv[i] << "\"" << std::endl;
     }
 
-    int masterfd;
-    char *slavedevice;
-
-    masterfd = posix_openpt(O_RDWR | O_NOCTTY);
+    int masterfd = posix_openpt(O_RDWR | O_NOCTTY);
 
     if (masterfd == -1 || grantpt(masterfd) == -1 || unlockpt(masterfd) == -1)
     {
         return -1;
     }
 
-    slavedevice = ptsname(masterfd);
-    if (slavedevice == NULL)
+    char *slavedevice = ptsname(masterfd);
+    if (slavedevice == nullptr)
     {
-        perror("ptsname()");
+        std::cerr << "ptsname() error: " << errno << std::endl;
         return -1;
     }
 
-    printf("slave device is: %s\n", slavedevice);
-
-    pid_t pid;
+    std::cout << "slave device is: " << slavedevice << std::endl;
 
     int ret;
-    pid = fork();
+    pid_t pid = fork();
     switch (pid)
     {
     case -1:
@@ -192,7 +186,7 @@ int main(int argc, char *const *argv)
 
     default:
         /* Parent process */
-        printf("Child pid %d\n", pid);
+        std::cout << "Child pid " << pid << std::endl;
 
         parent(masterfd);
     }
