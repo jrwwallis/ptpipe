@@ -10,30 +10,26 @@
 
 //namespace bp = boost::process;
 
-static constexpr size_t DEFAULT_BUFSZ = 4096;
+static const size_t DEFAULT_BUFSZ = 4096;
 
+// TODO pass list of set/unset flags to constructor
 class TermAttr
 {
 public:
-    explicit TermAttr(const int fd, const int clear_mask = 0, const int set_mask = 0) : fd{fd}
+    TermAttr(int fd) : fd{fd}
     {
         tcgetattr(fd, &oldt);
         newt = oldt;
-        newt.c_lflag &= ~clear_mask;
-        newt.c_lflag |= set_mask;
+        newt.c_lflag &= ~(ICANON);
         tcsetattr(fd, TCSANOW, &newt);
     };
-    // Not copyable or movable
-    TermAttr(const TermAttr&) = delete;
-    TermAttr& operator=(const TermAttr&) = delete;
     ~TermAttr()
     {
         tcsetattr(fd, TCSANOW, &oldt);
     };
 
 private:
-    struct termios oldt;
-    struct termios newt;
+    struct termios oldt, newt;
     int fd;
 };
 
@@ -42,7 +38,7 @@ namespace {
 class Splicer
 {
 public:
-    Splicer(const int in_fd, const int out_fd, const size_t bufsz = DEFAULT_BUFSZ):
+    Splicer(int in_fd, int out_fd, size_t bufsz = DEFAULT_BUFSZ):
         in_fd(in_fd), out_fd(out_fd), bufsz(bufsz), sp_thread(std::thread( [this] {fd_splice();})) {
     }
     ~Splicer() {
@@ -58,27 +54,35 @@ private:
     inline static std::mutex done_mutex{};
     inline static std::condition_variable done_condvar{};
     inline static bool all_done{false};
-    const int in_fd;
-    const int out_fd;
-    const size_t bufsz;
+    int in_fd;
+    int out_fd;
+    size_t bufsz;
 
     void fd_splice()
     {
-        ssize_t sz = 0;
+        ssize_t sz;
         std::vector<uint8_t> buf (bufsz);
 
-        while ((sz = read(in_fd, buf.data(), bufsz)) > 0) {
+        do
+        {
+            sz = read(in_fd, buf.data(), bufsz);
+            if (sz == -1)
+            {
+                std::cerr << "read(STDIN_FILENO) error: " << errno << std::endl;
+                break;
+            }
+            if (sz == 0)
+            {
+                break;
+            }
+            
             sz = write(out_fd, buf.data(), sz);
             if (sz == -1)
             {
                 std::cerr << "write(masterfd) error: " << errno << std::endl;
-                sz = 0;
                 break;
             }
-        }
-        if (sz == -1) {
-            std::cerr << "read(STDIN_FILENO) error: " << errno << std::endl;
-        }  
+        } while (sz > 0);
 
         {
             std::lock_guard<std::mutex> lk(done_mutex);
@@ -89,9 +93,9 @@ private:
 };
 
 
-int child(const int &masterfd, const int argc, char *const *argv)
+int child(int masterfd, int argc, char *const *argv)
 {
-    const char *slavedevice = ptsname(masterfd);
+    char *slavedevice = ptsname(masterfd);
     if (slavedevice == nullptr)
     {
         std::cerr << "ptsname() error: " << errno << std::endl;
@@ -101,7 +105,7 @@ int child(const int &masterfd, const int argc, char *const *argv)
     close(masterfd);
     setsid();
 
-    const int slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
+    int slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
     if (slavefd < 0)
     {
         return -1;
@@ -127,9 +131,9 @@ int child(const int &masterfd, const int argc, char *const *argv)
     return 0;
 }
 
-void parent(const int &masterfd)
+void parent(int masterfd)
 {
-    TermAttr ta{STDIN_FILENO, ICANON};
+    TermAttr ta{STDIN_FILENO};
 
     Splicer up{STDIN_FILENO, masterfd};
     Splicer down{masterfd, STDOUT_FILENO};
@@ -139,7 +143,7 @@ void parent(const int &masterfd)
 
 } // namespace
 
-int main(const int argc, char *const *argv)
+int main(int argc, char *const *argv)
 {
     std::cout << "argc=" << argc << std::endl;
     for (int i = 0; i < argc; i++)
@@ -147,14 +151,14 @@ int main(const int argc, char *const *argv)
         std::cout << "argv[" << i << "]=\"" << argv[i] << "\"" << std::endl;
     }
 
-    const int masterfd = posix_openpt(O_RDWR | O_NOCTTY);
+    int masterfd = posix_openpt(O_RDWR | O_NOCTTY);
 
     if (masterfd == -1 || grantpt(masterfd) == -1 || unlockpt(masterfd) == -1)
     {
         return -1;
     }
 
-    const char *slavedevice = ptsname(masterfd);
+    char *slavedevice = ptsname(masterfd);
     if (slavedevice == nullptr)
     {
         std::cerr << "ptsname() error: " << errno << std::endl;
@@ -163,22 +167,22 @@ int main(const int argc, char *const *argv)
 
     std::cout << "slave device is: " << slavedevice << std::endl;
 
+    int ret;
     pid_t pid = fork();
     switch (pid)
     {
     case -1:
-        std::cerr << "fork() error: " << errno << std::endl;
+        perror("fork()");
         return -1;
 
-    case 0: {
+    case 0:
         /* Child process */
-        const int ret = child(masterfd, argc, argv);
+        ret = child(masterfd, argc, argv);
         if (-1 == ret)
         {
             return ret;
         }
         break;
-    }
 
     default:
         /* Parent process */
