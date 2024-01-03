@@ -10,117 +10,123 @@
 
 //namespace bp = boost::process;
 
-static const size_t DEFAULT_BUFSZ = 4096;
+static const size_t kDefaultBufSize = 4096;
 
-// TODO pass list of set/unset flags to constructor
+// Adjust termios flags (e.g. clear ICANON for no input buffering)
+// Constructor sets flags, and destructor restores, once object goes out of scope
 class TermAttr
 {
 public:
-    TermAttr(int fd) : fd{fd}
+    // Constructor saves existing termios flags, and sets/clears flags
+    TermAttr(int fd, unsigned clear_flags = 0, unsigned set_flags = 0) : fd_{fd}
     {
-        tcgetattr(fd, &oldt);
-        newt = oldt;
-        newt.c_lflag &= ~(ICANON);
-        tcsetattr(fd, TCSANOW, &newt);
+        tcgetattr(fd, &old_term_);
+        new_term_ = old_term_;
+        new_term_.c_lflag &= ~clear_flags;
+        new_term_.c_lflag |= set_flags;
+        tcsetattr(fd, TCSANOW, &new_term_);
     };
+    // Destructor restores saved termios flags
     ~TermAttr()
     {
-        tcsetattr(fd, TCSANOW, &oldt);
+        tcsetattr(fd_, TCSANOW, &old_term_);
     };
 
 private:
-    struct termios oldt, newt;
-    int fd;
+    struct termios old_term_;
+    struct termios new_term_;
+    int fd_;
 };
 
 namespace {
 
+// Spawn a thread to copy data from one FD to another
 class Splicer
 {
 public:
-    Splicer(int in_fd, int out_fd, size_t bufsz = DEFAULT_BUFSZ):
-        in_fd(in_fd), out_fd(out_fd), bufsz(bufsz), sp_thread(std::thread( [this] {fd_splice();})) {
+    Splicer(int in_fd, int out_fd, size_t buf_size = kDefaultBufSize):
+        in_fd_(in_fd), out_fd_(out_fd), buf_size_(buf_size), sp_thread_(std::thread( [this] {FdSplice();})) {
     }
     ~Splicer() {
-        sp_thread.detach();
+        sp_thread_.detach();
     }
-    static inline void all_wait() {
-        std::unique_lock<std::mutex> lk(done_mutex);
-        done_condvar.wait(lk, []{return all_done;});
+    static inline void AllWait() {
+        std::unique_lock<std::mutex> lk(done_mutex_);
+        done_condvar_.wait(lk, []{return all_done_;});
     }
 
 private:
-    std::thread sp_thread;
-    inline static std::mutex done_mutex{};
-    inline static std::condition_variable done_condvar{};
-    inline static bool all_done{false};
-    int in_fd;
-    int out_fd;
-    size_t bufsz;
+    std::thread sp_thread_;
+    inline static std::mutex done_mutex_{};
+    inline static std::condition_variable done_condvar_{};
+    inline static bool all_done_{false};
+    int in_fd_;
+    int out_fd_;
+    size_t buf_size_;
 
-    void fd_splice()
+    void FdSplice()
     {
-        ssize_t sz;
-        std::vector<uint8_t> buf (bufsz);
+        ssize_t size;
+        std::vector<uint8_t> buf (buf_size_);
 
         do
         {
-            sz = read(in_fd, buf.data(), bufsz);
-            if (sz == -1)
+            size = read(in_fd_, buf.data(), buf_size_);
+            if (size == -1)
             {
                 std::cerr << "read(STDIN_FILENO) error: " << errno << std::endl;
                 break;
             }
-            if (sz == 0)
+            if (size == 0)
             {
                 break;
             }
             
-            sz = write(out_fd, buf.data(), sz);
-            if (sz == -1)
+            size = write(out_fd_, buf.data(), size);
+            if (size == -1)
             {
-                std::cerr << "write(masterfd) error: " << errno << std::endl;
+                std::cerr << "write(pt_fd) error: " << errno << std::endl;
                 break;
             }
-        } while (sz > 0);
+        } while (size > 0);
 
         {
-            std::lock_guard<std::mutex> lk(done_mutex);
-            all_done = true;
+            std::lock_guard<std::mutex> lk(done_mutex_);
+            all_done_ = true;
         }
-        done_condvar.notify_one();
+        done_condvar_.notify_one();
     }
 };
 
 
-int child(int masterfd, int argc, char *const *argv)
+int Child(int pt_fd, int argc, char *const *argv)
 {
-    char *slavedevice = ptsname(masterfd);
-    if (slavedevice == nullptr)
+    char *child_dev = ptsname(pt_fd);
+    if (child_dev == nullptr)
     {
         std::cerr << "ptsname() error: " << errno << std::endl;
         return -1;
     }
 
-    close(masterfd);
+    close(pt_fd);
     setsid();
 
-    int slavefd = open(slavedevice, O_RDWR | O_NOCTTY);
-    if (slavefd < 0)
+    int child_fd = open(child_dev, O_RDWR | O_NOCTTY);
+    if (child_fd < 0)
     {
         return -1;
     }
 
-    if (ioctl(slavefd, TIOCSCTTY, nullptr) == -1)
+    if (ioctl(child_fd, TIOCSCTTY, nullptr) == -1)
     {
         std::cerr << "ioctl(TIOCSCTTY) error: " << errno << std::endl;
         return -1;
     }
 
-    dup2(slavefd, STDIN_FILENO);
-    dup2(slavefd, STDOUT_FILENO);
-    dup2(slavefd, STDERR_FILENO);
-    close(slavefd);
+    dup2(child_fd, STDIN_FILENO);
+    dup2(child_fd, STDOUT_FILENO);
+    dup2(child_fd, STDERR_FILENO);
+    close(child_fd);
 
     if (execvp(argv[1], &argv[1]) == -1)
     {
@@ -131,14 +137,14 @@ int child(int masterfd, int argc, char *const *argv)
     return 0;
 }
 
-void parent(int masterfd)
+void Parent(int pt_fd)
 {
-    TermAttr ta{STDIN_FILENO};
+    TermAttr ta{STDIN_FILENO, ICANON};
 
-    Splicer up{STDIN_FILENO, masterfd};
-    Splicer down{masterfd, STDOUT_FILENO};
+    Splicer up{STDIN_FILENO, pt_fd};
+    Splicer down{pt_fd, STDOUT_FILENO};
 
-    Splicer::all_wait();
+    Splicer::AllWait();
 }
 
 } // namespace
@@ -151,21 +157,21 @@ int main(int argc, char *const *argv)
         std::cout << "argv[" << i << "]=\"" << argv[i] << "\"" << std::endl;
     }
 
-    int masterfd = posix_openpt(O_RDWR | O_NOCTTY);
+    int pt_fd = posix_openpt(O_RDWR | O_NOCTTY);
 
-    if (masterfd == -1 || grantpt(masterfd) == -1 || unlockpt(masterfd) == -1)
+    if (pt_fd == -1 || grantpt(pt_fd) == -1 || unlockpt(pt_fd) == -1)
     {
         return -1;
     }
 
-    char *slavedevice = ptsname(masterfd);
-    if (slavedevice == nullptr)
+    char *child_dev = ptsname(pt_fd);
+    if (child_dev == nullptr)
     {
         std::cerr << "ptsname() error: " << errno << std::endl;
         return -1;
     }
 
-    std::cout << "slave device is: " << slavedevice << std::endl;
+    std::cout << "child device is: " << child_dev << std::endl;
 
     int ret;
     pid_t pid = fork();
@@ -177,7 +183,7 @@ int main(int argc, char *const *argv)
 
     case 0:
         /* Child process */
-        ret = child(masterfd, argc, argv);
+        ret = Child(pt_fd, argc, argv);
         if (-1 == ret)
         {
             return ret;
@@ -188,13 +194,13 @@ int main(int argc, char *const *argv)
         /* Parent process */
         std::cout << "Child pid " << pid << std::endl;
 
-        parent(masterfd);
+        Parent(pt_fd);
     }
 
     int status;
 
     waitpid(pid, &status, 0);
-    close(masterfd);
+    close(pt_fd);
     if (WIFEXITED(status))
     {
         return WEXITSTATUS(status);
