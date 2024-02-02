@@ -10,7 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-//#include <boost/process.hpp>
+// #include <boost/process.hpp>
 
 // namespace bp = boost::process;
 
@@ -20,7 +20,7 @@ static const size_t kDefaultBufSize = 4096;
 // Constructor sets flags, and destructor restores, once object goes out of
 // scope
 class TermAttr {
-public:
+ public:
   // Constructor saves existing termios flags, and sets/clears flags
   TermAttr(int fd, unsigned clear_flags = 0, unsigned set_flags = 0) : fd_{fd} {
     tcgetattr(fd, &old_term_);
@@ -35,7 +35,7 @@ public:
   // Destructor restores saved termios flags
   ~TermAttr() { tcsetattr(fd_, TCSANOW, &old_term_); };
 
-private:
+ private:
   struct termios old_term_;
   struct termios new_term_;
   int fd_;
@@ -45,14 +45,16 @@ namespace {
 
 // Spawn a thread to copy data from one FD to another
 class Splicer {
-public:
+ public:
   Splicer(int in_fd, int out_fd, size_t buf_size = kDefaultBufSize)
-      : in_fd_(in_fd), out_fd_(out_fd), buf_size_(buf_size),
+      : in_fd_(in_fd),
+        out_fd_(out_fd),
+        buf_size_(buf_size),
         sp_thread_(std::thread([this] { FdSplice(); })) {}
   ~Splicer() { sp_thread_.detach(); }
   static void AllWait();
 
-private:
+ private:
   static std::mutex done_mutex_;
   static std::condition_variable done_condvar_;
   static bool all_done_;
@@ -133,7 +135,7 @@ void Parent(int pt_fd) {
   Splicer::AllWait();
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char *const *argv) {
   std::cout << "argc=" << argc << std::endl;
@@ -151,22 +153,22 @@ int main(int argc, char *const *argv) {
   int ret;
   pid_t pid = fork();
   switch (pid) {
-  case -1:
-    std::cerr << "fork() error: " << errno << std::endl;
-    return -1;
+    case -1:
+      std::cerr << "fork() error: " << errno << std::endl;
+      return -1;
 
-  case 0:
-    /* Child process */
-    ret = Child(pt_fd, argc, argv);
-    if (-1 == ret) {
-      return ret;
-    }
-    break;
+    case 0:
+      /* Child process */
+      ret = Child(pt_fd, argc, argv);
+      if (-1 == ret) {
+        return ret;
+      }
+      break;
 
-  default:
-    /* Parent process */
-    std::cout << "Child pid " << pid << std::endl;
-    Parent(pt_fd);
+    default:
+      /* Parent process */
+      std::cout << "Child pid " << pid << std::endl;
+      Parent(pt_fd);
   }
 
   int status = 0;
