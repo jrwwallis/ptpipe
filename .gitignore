@@ -2,3 +2,4 @@ ptwrap
 ptwrap.dSYM
 *~
 core*
+bazel-*
