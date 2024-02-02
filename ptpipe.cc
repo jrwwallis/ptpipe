@@ -46,9 +46,10 @@ namespace {
 // Spawn a thread to copy data from one FD to another
 class Splicer {
  public:
-  Splicer(int in_fd, int out_fd, size_t buf_size = kDefaultBufSize)
+  Splicer(int in_fd, int out_fd, std::string name = "", size_t buf_size = kDefaultBufSize)
       : in_fd_(in_fd),
         out_fd_(out_fd),
+        name_(name),
         buf_size_(buf_size),
         sp_thread_(std::thread([this] { FdSplice(); })) {}
   ~Splicer() { sp_thread_.detach(); }
@@ -60,6 +61,7 @@ class Splicer {
   static bool all_done_;
   int in_fd_;
   int out_fd_;
+  std::string name_;
   size_t buf_size_;
   std::thread sp_thread_;
 
@@ -82,12 +84,12 @@ void Splicer::FdSplice() {
   while ((read_size = read(in_fd_, buf.data(), buf_size_)) > 0) {
     ssize_t write_size = write(out_fd_, buf.data(), read_size);
     if (write_size == -1) {
-      std::cerr << "write(" << out_fd_ << ") error: " << errno << std::endl;
+      std::cerr << name_ << " write(" << out_fd_ << ") error: " << errno << std::endl;
       break;
     }
   };
   if (read_size == -1) {
-    std::cerr << "read(" << in_fd_ << ") error: " << errno << std::endl;
+    std::cerr << name_ << " read(" << in_fd_ << ") error: " << errno << std::endl;
   }
 
   {
@@ -129,8 +131,8 @@ int Child(int pt_fd, int argc, char *const *argv) {
 void Parent(int pt_fd) {
   TermAttr ta{STDIN_FILENO, ICANON};
 
-  Splicer up{STDIN_FILENO, pt_fd};
-  Splicer down{pt_fd, STDOUT_FILENO};
+  Splicer up{STDIN_FILENO, pt_fd, "up"};
+  Splicer down{pt_fd, STDOUT_FILENO, "down"};
 
   Splicer::AllWait();
 }
