@@ -29,9 +29,12 @@ class TermAttr {
     new_term_.c_lflag |= set_flags;
     tcsetattr(fd, TCSANOW, &new_term_);
   };
-  // No need to copy (or move)
+  // Copy doesn't make sense as a unique object is required to track the given terminal resource
   TermAttr(const TermAttr &) = delete;
   TermAttr &operator=(const TermAttr &) = delete;
+  // Move is possibly useful
+  TermAttr(TermAttr &&) = default;
+  TermAttr &operator=(TermAttr &&) = default;
   // Destructor restores saved termios flags
   ~TermAttr() { tcsetattr(fd_, TCSANOW, &old_term_); };
 
