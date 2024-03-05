@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -29,7 +30,8 @@ class TermAttr {
     new_term_.c_lflag |= set_flags;
     tcsetattr(fd, TCSANOW, &new_term_);
   };
-  // Copy doesn't make sense as a unique object is required to track the given terminal resource
+  // Copy doesn't make sense as a unique object is required to track the given
+  // terminal resource
   TermAttr(const TermAttr &) = delete;
   TermAttr &operator=(const TermAttr &) = delete;
   // Move is possibly useful
@@ -49,7 +51,8 @@ namespace {
 // Spawn a thread to copy data from one FD to another
 class Splicer {
  public:
-  Splicer(int in_fd, int out_fd, std::string name = "", size_t buf_size = kDefaultBufSize)
+  Splicer(int in_fd, int out_fd, std::string name = "",
+          size_t buf_size = kDefaultBufSize)
       : in_fd_(in_fd),
         out_fd_(out_fd),
         name_(name),
@@ -69,6 +72,7 @@ class Splicer {
   std::thread sp_thread_;
 
   void FdSplice();
+  bool IsPipe(int fd);
 };
 
 std::mutex Splicer::done_mutex_{};
@@ -81,18 +85,33 @@ void Splicer::AllWait() {
 }
 
 void Splicer::FdSplice() {
-  ssize_t read_size;
-  std::vector<uint8_t> buf(buf_size_);
+  if (IsPipe(in_fd_) || IsPipe(out_fd_)) {
+    ssize_t splice_size;
 
-  while ((read_size = read(in_fd_, buf.data(), buf_size_)) > 0) {
-    ssize_t write_size = write(out_fd_, buf.data(), read_size);
-    if (write_size == -1) {
-      std::cerr << name_ << " write(" << out_fd_ << ") error: " << errno << std::endl;
-      break;
+    while ((splice_size = splice(in_fd_, NULL, out_fd_, NULL, buf_size_,
+                                 SPLICE_F_MOVE | SPLICE_F_MORE)) >= 0) {
     }
-  };
-  if (read_size == -1) {
-    std::cerr << name_ << " read(" << in_fd_ << ") error: " << errno << std::endl;
+    if (splice_size == -1) {
+      std::cerr << name_ << " splice(" << in_fd_ << ", " << out_fd_
+                << ") error: " << errno << std::endl;
+    }
+
+  } else {
+    ssize_t read_size;
+    std::vector<uint8_t> buf(buf_size_);
+
+    while ((read_size = read(in_fd_, buf.data(), buf_size_)) > 0) {
+      ssize_t write_size = write(out_fd_, buf.data(), read_size);
+      if (write_size == -1) {
+        std::cerr << name_ << " write(" << out_fd_ << ") error: " << errno
+                  << std::endl;
+        break;
+      }
+    };
+    if (read_size == -1) {
+      std::cerr << name_ << " read(" << in_fd_ << ") error: " << errno
+                << std::endl;
+    }
   }
 
   {
@@ -100,6 +119,11 @@ void Splicer::FdSplice() {
     all_done_ = true;
   }
   done_condvar_.notify_one();
+}
+
+bool Splicer::IsPipe(int fd) {
+  struct stat stat_buf;
+  return ::fstat(fd, &stat_buf) && S_ISFIFO(stat_buf.st_mode);
 }
 
 int Child(int pt_fd, int argc, char *const *argv) {
