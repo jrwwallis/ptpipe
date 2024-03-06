@@ -138,7 +138,7 @@ bool Splicer::IsPipe(int fd) {
   return ::fstat(fd, &stat_buf) && S_ISFIFO(stat_buf.st_mode);
 }
 
-int Child(int pt_fd, int argc, char *const *argv) {
+int Child(int pt_fd, int err_fd, int argc, char *const *argv) {
   std::string child_dev(ptsname(pt_fd) ?: "");
 
   close(pt_fd);
@@ -156,8 +156,9 @@ int Child(int pt_fd, int argc, char *const *argv) {
 
   dup2(child_fd, STDIN_FILENO);
   dup2(child_fd, STDOUT_FILENO);
-  dup2(child_fd, STDERR_FILENO);
+  dup2(err_fd, STDERR_FILENO);
   close(child_fd);
+  close(err_fd);
 
   if (execvp(argv[1], &argv[1]) == -1) {
     std::cerr << "execvp() error: " << errno << std::endl;
@@ -167,11 +168,12 @@ int Child(int pt_fd, int argc, char *const *argv) {
   return 0;
 }
 
-void Parent(int pt_fd) {
+void Parent(int pt_fd, int err_fd) {
   TermAttr ta{STDIN_FILENO, ICANON};
 
   Splicer up{STDIN_FILENO, pt_fd, "up"};
   Splicer down{pt_fd, STDOUT_FILENO, "down"};
+  Splicer down_err{err_fd, STDERR_FILENO, "down err"};
 
   Splicer::AllWait();
 }
@@ -191,6 +193,12 @@ int main(int argc, char *const *argv) {
 
   std::cout << "child device is: " << (ptsname(pt_fd) ?: "") << std::endl;
 
+  int err_fd[2];
+  if (pipe(err_fd) == -1) {
+      std::cerr << "pipe() error: " << errno << std::endl;
+      return -1;
+  }
+
   int ret;
   pid_t pid = fork();
   switch (pid) {
@@ -200,7 +208,7 @@ int main(int argc, char *const *argv) {
 
     case 0:
       /* Child process */
-      ret = Child(pt_fd, argc, argv);
+      ret = Child(pt_fd, err_fd[1], argc, argv);
       if (-1 == ret) {
         return ret;
       }
@@ -209,7 +217,7 @@ int main(int argc, char *const *argv) {
     default:
       /* Parent process */
       std::cout << "Child pid " << pid << std::endl;
-      Parent(pt_fd);
+      Parent(pt_fd, err_fd[0]);
   }
 
   int status = 0;
