@@ -28,7 +28,7 @@ class TermAttr {
     new_term_ = old_term_;
     new_term_.c_lflag &= ~clear_flags;
     new_term_.c_lflag |= set_flags;
-    tcsetattr(fd, TCSANOW, &new_term_);
+    ::tcsetattr(fd, TCSANOW, &new_term_);
   };
   // Copy doesn't make sense as a unique object is required to track the given
   // terminal resource
@@ -38,7 +38,7 @@ class TermAttr {
   TermAttr(TermAttr &&) = default;
   TermAttr &operator=(TermAttr &&) = default;
   // Destructor restores saved termios flags
-  ~TermAttr() { tcsetattr(fd_, TCSANOW, &old_term_); };
+  ~TermAttr() { ::tcsetattr(fd_, TCSANOW, &old_term_); };
 
  private:
   struct termios old_term_;
@@ -97,7 +97,7 @@ void Splicer::FdSplice() {
   if (has_pipe_) {
     ssize_t splice_size;
 
-    while ((splice_size = splice(in_fd_, NULL, out_fd_, NULL, buf_size_,
+    while ((splice_size = ::splice(in_fd_, NULL, out_fd_, NULL, buf_size_,
                                  SPLICE_F_MOVE | SPLICE_F_MORE)) >= 0) {
     }
     if (splice_size == -1) {
@@ -110,8 +110,8 @@ void Splicer::FdSplice() {
     ssize_t read_size;
     std::vector<uint8_t> buf(buf_size_);
 
-    while ((read_size = read(in_fd_, buf.data(), buf_size_)) > 0) {
-      ssize_t write_size = write(out_fd_, buf.data(), read_size);
+    while ((read_size = ::read(in_fd_, buf.data(), buf_size_)) > 0) {
+      ssize_t write_size = ::write(out_fd_, buf.data(), read_size);
       if (write_size == -1) {
         std::cerr << name_ << " write(" << out_fd_ << ") error: " << errno
                   << std::endl;
@@ -139,28 +139,28 @@ bool Splicer::IsPipe(int fd) {
 }
 
 int Child(int pt_fd, int err_fd, int argc, char *const *argv) {
-  std::string child_dev(ptsname(pt_fd) ?: "");
+  std::string child_dev(::ptsname(pt_fd) ?: "");
 
-  close(pt_fd);
-  setsid();
+  ::close(pt_fd);
+  ::setsid();
 
-  int child_fd = open(child_dev.c_str(), O_RDWR | O_NOCTTY);
+  int child_fd = ::open(child_dev.c_str(), O_RDWR | O_NOCTTY);
   if (child_fd < 0) {
     return -1;
   }
 
-  if (ioctl(child_fd, TIOCSCTTY, nullptr) == -1) {
+  if (::ioctl(child_fd, TIOCSCTTY, nullptr) == -1) {
     std::cerr << "ioctl(TIOCSCTTY) error: " << errno << std::endl;
     return -1;
   }
 
-  dup2(child_fd, STDIN_FILENO);
-  dup2(child_fd, STDOUT_FILENO);
-  dup2(err_fd, STDERR_FILENO);
-  close(child_fd);
-  close(err_fd);
+  ::dup2(child_fd, STDIN_FILENO);
+  ::dup2(child_fd, STDOUT_FILENO);
+  ::dup2(err_fd, STDERR_FILENO);
+  ::close(child_fd);
+  ::close(err_fd);
 
-  if (execvp(argv[1], &argv[1]) == -1) {
+  if (::execvp(argv[1], &argv[1]) == -1) {
     std::cerr << "execvp() error: " << errno << std::endl;
     return -1;
   }
@@ -186,21 +186,21 @@ int main(int argc, char *const *argv) {
     std::cout << "argv[" << i << "]=\"" << argv[i] << "\"" << std::endl;
   }
 
-  int pt_fd = posix_openpt(O_RDWR | O_NOCTTY);
-  if (pt_fd == -1 || grantpt(pt_fd) == -1 || unlockpt(pt_fd) == -1) {
+  int pt_fd = ::posix_openpt(O_RDWR | O_NOCTTY);
+  if (pt_fd == -1 || ::grantpt(pt_fd) == -1 || ::unlockpt(pt_fd) == -1) {
     return -1;
   }
 
-  std::cout << "child device is: " << (ptsname(pt_fd) ?: "") << std::endl;
+  std::cout << "child device is: " << (::ptsname(pt_fd) ?: "") << std::endl;
 
   int err_fd[2];
-  if (pipe(err_fd) == -1) {
+  if (::pipe(err_fd) == -1) {
       std::cerr << "pipe() error: " << errno << std::endl;
       return -1;
   }
 
   int ret;
-  pid_t pid = fork();
+  pid_t pid = ::fork();
   switch (pid) {
     case -1:
       std::cerr << "fork() error: " << errno << std::endl;
@@ -221,8 +221,8 @@ int main(int argc, char *const *argv) {
   }
 
   int status = 0;
-  waitpid(pid, &status, 0);
-  close(pt_fd);
+  ::waitpid(pid, &status, 0);
+  ::close(pt_fd);
   if (WIFEXITED(status)) {
     return WEXITSTATUS(status);
   } else if (WIFSIGNALED(status)) {
