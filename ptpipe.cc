@@ -57,11 +57,18 @@ class Splicer {
         out_fd_(out_fd),
         name_(name),
         buf_size_(buf_size),
-        sp_thread_(std::thread([this] { FdSplice(); })) {}
+        sp_thread_(std::thread([this] { FdSplice(); })),
+        has_pipe_(IsPipe(in_fd_) || IsPipe(out_fd_)) {}
   ~Splicer() { sp_thread_.detach(); }
   static void AllWait();
 
  private:
+  Splicer() = delete;
+  Splicer(const Splicer &) = delete;
+  Splicer &operator=(const Splicer &) = delete;
+  Splicer(Splicer &&) = delete;
+  Splicer &operator=(Splicer &&) = delete;
+
   static std::mutex done_mutex_;
   static std::condition_variable done_condvar_;
   static bool all_done_;
@@ -70,9 +77,10 @@ class Splicer {
   std::string name_;
   size_t buf_size_;
   std::thread sp_thread_;
+  const bool has_pipe_;
 
   void FdSplice();
-  bool IsPipe(int fd);
+  static bool IsPipe(int fd);
 };
 
 std::mutex Splicer::done_mutex_{};
@@ -85,7 +93,8 @@ void Splicer::AllWait() {
 }
 
 void Splicer::FdSplice() {
-  if (IsPipe(in_fd_) || IsPipe(out_fd_)) {
+#ifdef SPLICE_F_MOVE
+  if (has_pipe_) {
     ssize_t splice_size;
 
     while ((splice_size = splice(in_fd_, NULL, out_fd_, NULL, buf_size_,
@@ -97,6 +106,7 @@ void Splicer::FdSplice() {
     }
 
   } else {
+#endif
     ssize_t read_size;
     std::vector<uint8_t> buf(buf_size_);
 
@@ -112,7 +122,9 @@ void Splicer::FdSplice() {
       std::cerr << name_ << " read(" << in_fd_ << ") error: " << errno
                 << std::endl;
     }
+#ifdef SPLICE_F_MOVE
   }
+#endif
 
   {
     std::lock_guard<std::mutex> lk(done_mutex_);
